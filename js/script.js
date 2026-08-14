@@ -249,6 +249,7 @@ async function transcribeChunk(wavBlob, apiKey, timeOffset, langOverride, attemp
   const words = json?.results?.channels?.[0]?.alternatives?.[0]?.words || [];
 
   if (words.length === 0 && transcript.trim()) {
+    log('  No word-level timestamps for this chunk — using estimated spacing (less precise)', 'err');
     const chunkDur = wavBlob.size / (16000 * 2);
     const wList = transcript.trim().split(/\s+/);
     const avgLen = chunkDur / Math.max(wList.length, 1);
@@ -261,6 +262,37 @@ async function transcribeChunk(wavBlob, apiKey, timeOffset, langOverride, attemp
     end:   parseFloat(w.end)   + timeOffset,
     conf:  w.confidence
   }));
+}
+
+// ── Audio-driven caption gate ──────────────────────────────────
+// Deepgram's word timestamps can be unreliable on sung audio — sometimes they cover the
+// whole clip back-to-back with no gaps, which makes captions look like they never stop
+// even through instrumental breaks. This measures actual loudness over time so captions
+// only show while something is really sounding, independent of how good the timestamps are.
+function computeEnergyMap(buffer, windowSec = 0.15) {
+  const sr = buffer.sampleRate;
+  const data = buffer.getChannelData(0);
+  const windowSize = Math.max(1, Math.floor(windowSec * sr));
+  const numWindows = Math.ceil(data.length / windowSize);
+  const energies = new Float32Array(numWindows);
+  let max = 0;
+  for (let w = 0; w < numWindows; w++) {
+    const start = w * windowSize;
+    const end = Math.min(start + windowSize, data.length);
+    let sum = 0;
+    for (let i = start; i < end; i++) sum += data[i] * data[i];
+    const rms = Math.sqrt(sum / (end - start));
+    energies[w] = rms;
+    if (rms > max) max = rms;
+  }
+  return { energies, windowSec, max: max || 1 };
+}
+
+function isSilentAt(energyMap, t) {
+  if (!energyMap) return false;
+  const idx = Math.floor(t / energyMap.windowSec);
+  const e = energyMap.energies[idx] || 0;
+  return e < energyMap.max * 0.07;
 }
 
 function fillGaps(words) {
@@ -276,15 +308,56 @@ function fillGaps(words) {
   return out;
 }
 
-// Roman Hindi ("Hinglish") — transliterates only non-Latin words, leaves English words untouched
-// so mixed Hindi/English lyrics keep their English parts exactly as sung.
-function applyHinglish(words) {
-  if (typeof transliterate !== 'function') {
-    log('Hinglish library unavailable — showing native script instead', 'err');
-    return words;
+// ── Devanagari → Hinglish (Roman Hindi), fully local — no CDN dependency, can't go offline ──
+const DEV_VOWELS = { 'अ':'a','आ':'aa','इ':'i','ई':'ee','उ':'u','ऊ':'oo','ऋ':'ri','ए':'e','ऐ':'ai','ओ':'o','औ':'au' };
+const DEV_MATRAS = { 'ा':'aa','ि':'i','ी':'ee','ु':'u','ू':'oo','ृ':'ri','े':'e','ै':'ai','ो':'o','ौ':'au' };
+const DEV_CONSONANTS = {
+  'क':'k','ख':'kh','ग':'g','घ':'gh','ङ':'ng',
+  'च':'ch','छ':'chh','ज':'j','झ':'jh','ञ':'ny',
+  'ट':'t','ठ':'th','ड':'d','ढ':'dh','ण':'n',
+  'त':'t','थ':'th','द':'d','ध':'dh','न':'n',
+  'प':'p','फ':'ph','ब':'b','भ':'bh','म':'m',
+  'य':'y','र':'r','ल':'l','व':'v',
+  'श':'sh','ष':'sh','स':'s','ह':'h',
+  'क़':'q','ख़':'kh','ग़':'gh','ज़':'z','ड़':'r','ढ़':'rh','फ़':'f'
+};
+const DEV_DIGITS = { '०':'0','१':'1','२':'2','३':'3','४':'4','५':'5','६':'6','७':'7','८':'8','९':'9' };
+
+function devanagariToHinglish(text) {
+  const chars = Array.from(text);
+  let out = '';
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i];
+    if (DEV_VOWELS[c])  { out += DEV_VOWELS[c]; continue; }
+    if (DEV_DIGITS[c])  { out += DEV_DIGITS[c]; continue; }
+    if (c === 'ं' || c === 'ँ') { out += 'n'; continue; }
+    if (c === 'ः') { out += 'h'; continue; }
+    if (c === '़') { continue; }
+    if (c === '्') { continue; }               // virama — handled via lookahead below
+    if (c === '।' || c === '॥') { out += '.'; continue; }
+
+    if (DEV_CONSONANTS[c]) {
+      out += DEV_CONSONANTS[c];
+      const next = chars[i + 1];
+      if (next === '्') { i++; }                // suppress inherent vowel
+      else if (next && DEV_MATRAS[next]) { out += DEV_MATRAS[next]; i++; }
+      else { out += 'a'; }                       // inherent 'a'
+      continue;
+    }
+    out += c;                                    // spaces, Latin letters, punctuation pass through
   }
+  return out;
+}
+
+// Only non-Latin words get converted, so mixed Hindi/English lyrics keep their
+// English parts exactly as sung. No network dependency, so it can't silently fail.
+function applyHinglish(words) {
   const nonLatin = /[^\u0000-\u007F]/;
-  return words.map(w => (w.word && nonLatin.test(w.word)) ? { ...w, word: transliterate(w.word) } : w);
+  return words.map(w => {
+    if (!w.word || !nonLatin.test(w.word)) return w;
+    try { return { ...w, word: devanagariToHinglish(w.word) }; }
+    catch { return w; } // graceful fallback — keep native script rather than crash
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -385,7 +458,7 @@ function drawMixStyle(ctx, W, H, words, activeWord, activeIdx, t) {
   ctx.restore();
 }
 
-function generateVideo(words, style, durationSec, quality) {
+function generateVideo(words, style, durationSec, quality, energyMap) {
   return new Promise((resolve, reject) => {
     const { w: W, h: H } = QUALITY[quality] || QUALITY.full;
     const canvas = document.createElement('canvas');
@@ -415,7 +488,7 @@ function generateVideo(words, style, durationSec, quality) {
       ctx.fillRect(0, 0, W, H);
 
       const activeWord = words.find(w => !w.gap && w.start <= t && w.end >= t);
-      if (activeWord) {
+      if (activeWord && !isSilentAt(energyMap, t)) {
         const activeIdx = words.indexOf(activeWord);
         if (style === 'mix') {
           drawMixStyle(ctx, W, H, words, activeWord, activeIdx, t);
@@ -462,11 +535,14 @@ async function processAudio() {
     const totalDur = buffer.duration;
     log('Duration: ' + totalDur.toFixed(1) + 's | ' + buffer.sampleRate + ' Hz');
 
+    // Measured before noise reduction/compression so it reflects real loudness, for caption gating
+    const energyMap = computeEnergyMap(buffer, 0.15);
+
     setProgress(15, 'Removing background noise...');
     buffer = await reduceNoise(buffer);
     log('Noise reduction done', 'ok');
 
-    const CHUNK = 25;
+    const CHUNK = 15; // smaller chunks keep Whisper's word timestamps from drifting on sung audio
     const numChunks = Math.ceil(totalDur / CHUNK);
     let allWords = [];
 
@@ -502,7 +578,7 @@ async function processAudio() {
     }
 
     setProgress(82, 'Rendering green screen video...');
-    generatedBlob = await generateVideo(allWords, selectedStyle, totalDur, selectedQuality);
+    generatedBlob = await generateVideo(allWords, selectedStyle, totalDur, selectedQuality, energyMap);
     log('Video rendered! Size: ' + (generatedBlob.size / 1024 / 1024).toFixed(1) + ' MB', 'ok');
 
     setProgress(100, 'Done!');
@@ -544,10 +620,21 @@ function triggerDownload(blob, ext) {
 // ─────────────────────────────────────────────────────────────
 //  WEBM → MP4 CONVERSION (client-side, ffmpeg.wasm, single-thread — no server needed)
 // ─────────────────────────────────────────────────────────────
+// @ffmpeg/util's UMD build is unreliable when loaded via a plain <script> tag (known
+// "exports is not defined" / global-not-exposed issue), so its two helpers are hand-rolled
+// here instead of depending on that package at all.
+async function fetchFileLocal(blob) {
+  return new Uint8Array(await blob.arrayBuffer());
+}
+async function toBlobURLLocal(url, mimeType) {
+  const resp = await fetch(url);
+  const buf = await resp.arrayBuffer();
+  return URL.createObjectURL(new Blob([buf], { type: mimeType }));
+}
+
 async function loadFfmpeg() {
   if (ffmpegInstance) return ffmpegInstance;
   const { FFmpeg } = FFmpegWASM;
-  const { toBlobURL } = FFmpegUtil;
   const ffmpeg = new FFmpeg();
   const progEl = document.getElementById('mp4Progress');
 
@@ -557,8 +644,8 @@ async function loadFfmpeg() {
 
   const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
   await ffmpeg.load({
-    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm')
+    coreURL: await toBlobURLLocal(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+    wasmURL: await toBlobURLLocal(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm')
   });
 
   ffmpegInstance = ffmpeg;
@@ -574,14 +661,13 @@ async function downloadMp4() {
 
   btn.disabled = true;
   progEl.style.display = 'block';
-  progEl.textContent = 'Loading converter (first time only)...';
+  progEl.textContent = 'Loading converter (first time only, ~25MB)...';
 
   try {
-    const { fetchFile } = FFmpegUtil;
     const ffmpeg = await loadFfmpeg();
 
     progEl.textContent = 'Converting...';
-    await ffmpeg.writeFile('input.webm', await fetchFile(generatedBlob));
+    await ffmpeg.writeFile('input.webm', await fetchFileLocal(generatedBlob));
     await ffmpeg.exec(['-i', 'input.webm', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p', 'output.mp4']);
     const data = await ffmpeg.readFile('output.mp4');
 
